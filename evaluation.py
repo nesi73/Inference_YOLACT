@@ -17,27 +17,6 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 import cv2
 
-# for making bounding boxes pretty
-COLORS = ((244,  67,  54),
-          (233,  30,  99),
-          (156,  39, 176),
-          (103,  58, 183),
-          ( 63,  81, 181),
-          ( 33, 150, 243),
-          (  3, 169, 244),
-          (  0, 188, 212),
-          (  0, 150, 136),
-          ( 76, 175,  80),
-          (139, 195,  74),
-          (205, 220,  57),
-          (255, 235,  59),
-          (255, 193,   7),
-          (255, 152,   0),
-          (255,  87,  34),
-          (121,  85,  72),
-          (158, 158, 158),
-          ( 96, 125, 139))
-
 def str2bool(v):
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
         return True
@@ -173,108 +152,39 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
             masks = t[3][idx]
         classes, scores, boxes = [x[idx].cpu().numpy() for x in t[:3]]
 
-    num_dets_to_consider = min(args.top_k, classes.shape[0])
-    for j in range(num_dets_to_consider):
-        if scores[j] < args.score_threshold:
-            num_dets_to_consider = j
-            break
-
-    # Quick and dirty lambda for selecting the color for a particular index
-    # Also keeps track of a per-gpu color cache for maximum speed
-    def get_color(j, on_gpu=None):
-        global color_cache
-        color_idx = (classes[j] * 5 if class_color else j * 5) % len(COLORS)
-        
-        if on_gpu is not None and color_idx in color_cache[on_gpu]:
-            return color_cache[on_gpu][color_idx]
+        scores = t[1]
+        if isinstance(scores, list):
+            box_scores = list(scores[0].cpu().numpy().astype(float))
+            mask_scores = list(scores[1].cpu().numpy().astype(float))
         else:
-            color = COLORS[color_idx]
-            if not undo_transform:
-                # The image might come in as RGB or BRG, depending
-                color = (color[2], color[1], color[0])
-            if on_gpu is not None:
-                color = torch.Tensor(color).to(on_gpu).float() / 255.
-                color_cache[on_gpu][color_idx] = color
-            return color
+            scores = list(scores.cpu().numpy().astype(float))
+            box_scores = scores
+            mask_scores = scores
 
-    # First, draw the masks on the GPU where we can do it really fast
-    # Beware: very fast but possibly unintelligible mask-drawing code ahead
-    # I wish I had access to OpenGL or Vulkan but alas, I guess Pytorch tensor operations will have to suffice
-    if args.display_masks and cfg.eval_mask_branch and num_dets_to_consider > 0:
-        # After this, mask is of size [num_dets, h, w, 1]
-        masks = masks[:num_dets_to_consider, :, :, None]
-        
-        # Prepare the RGB images for each mask given their color (size [num_dets, h, w, 1])
-        colors = torch.cat([get_color(j, on_gpu=img_gpu.device.index).view(1, 1, 1, 3) for j in range(num_dets_to_consider)], dim=0)
-        masks_color = masks.repeat(1, 1, 1, 3) * colors * mask_alpha
+        masks = t[3][idx].view(-1, h, w).cpu().numpy()
+        from pycocotools import mask
+        from skimage import measure
+        all_boxes = []
+        all_segmentations = []
+        for i in range(masks.shape[0]):
+            # Make sure that the bounding box actually makes sense and a mask was produced
+            if (boxes[i, 3] - boxes[i, 1]) * (boxes[i, 2] - boxes[i, 0]) > 0:
+                # rle = pycocotools.mask.encode(np.asfortranarray(masks[i,:,:].astype(np.uint8)))
+                # rle['counts'] = rle['counts'].decode('ascii') # json.dump doesn't like bytes strings
+                ground_truth_binary_mask = masks[i,:,:].astype(np.uint8)
+                fortran_ground_truth_binary_mask = np.asfortranarray(ground_truth_binary_mask)
+                encoded_ground_truth = mask.encode(fortran_ground_truth_binary_mask)
+                ground_truth_area = mask.area(encoded_ground_truth)
+                ground_truth_bounding_box = mask.toBbox(encoded_ground_truth)
+                contours = measure.find_contours(ground_truth_binary_mask, 0.5)
+                for contour in contours:
+                    contour = np.flip(contour, axis=1)
+                    segmentation = contour.ravel().tolist()
+                # a=classes[i], boxes[i,:], box_scores[i]
+                all_boxes.append(boxes[i,:])
+                all_segmentations.append(segmentation)
+    return all_boxes, all_segmentations, scores, classes
 
-        # This is 1 everywhere except for 1-mask_alpha where the mask is
-        inv_alph_masks = masks * (-mask_alpha) + 1
-        
-        # I did the math for this on pen and paper. This whole block should be equivalent to:
-        #    for j in range(num_dets_to_consider):
-        #        img_gpu = img_gpu * inv_alph_masks[j] + masks_color[j]
-        masks_color_summand = masks_color[0]
-        if num_dets_to_consider > 1:
-            inv_alph_cumul = inv_alph_masks[:(num_dets_to_consider-1)].cumprod(dim=0)
-            masks_color_cumul = masks_color[1:] * inv_alph_cumul
-            masks_color_summand += masks_color_cumul.sum(dim=0)
-
-        img_gpu = img_gpu * inv_alph_masks.prod(dim=0) + masks_color_summand
-    
-    if args.display_fps:
-            # Draw the box for the fps on the GPU
-        font_face = cv2.FONT_HERSHEY_DUPLEX
-        font_scale = 0.6
-        font_thickness = 1
-
-        text_w, text_h = cv2.getTextSize(fps_str, font_face, font_scale, font_thickness)[0]
-
-        img_gpu[0:text_h+8, 0:text_w+8] *= 0.6 # 1 - Box alpha
-
-
-    # Then draw the stuff that needs to be done on the cpu
-    # Note, make sure this is a uint8 tensor or opencv will not anti alias text for whatever reason
-    img_numpy = (img_gpu * 255).byte().cpu().numpy()
-
-    if args.display_fps:
-        # Draw the text on the CPU
-        text_pt = (4, text_h + 2)
-        text_color = [255, 255, 255]
-
-        cv2.putText(img_numpy, fps_str, text_pt, font_face, font_scale, text_color, font_thickness, cv2.LINE_AA)
-    
-    if num_dets_to_consider == 0:
-        return img_numpy
-
-    if args.display_text or args.display_bboxes:
-        for j in reversed(range(num_dets_to_consider)):
-            x1, y1, x2, y2 = boxes[j, :]
-            color = get_color(j)
-            color = (0, 255, 0)
-            score = scores[j]
-
-            if args.display_bboxes:
-                cv2.rectangle(img_numpy, (x1, y1), (x2, y2), color, 1)
-
-            if args.display_text:
-                _class = cfg.dataset.class_names[classes[j]]
-                text_str = '%s: %.2f' % (_class, score) if args.display_scores else _class
-
-                font_face = cv2.FONT_HERSHEY_DUPLEX
-                font_scale = 0.6
-                font_thickness = 1
-
-                text_w, text_h = cv2.getTextSize(text_str, font_face, font_scale, font_thickness)[0]
-
-                text_pt = (x1, y1 - 3)
-                text_color = [255, 255, 255]
-
-                cv2.rectangle(img_numpy, (x1, y1), (x1 + text_w, y1 - text_h - 4), color, -1)
-                cv2.putText(img_numpy, text_str, text_pt, font_face, font_scale, text_color, font_thickness, cv2.LINE_AA)
-            
-    
-    return img_numpy
 
 def prep_benchmark(dets_out, h, w):
     with timer.env('Postprocess'):
@@ -294,8 +204,24 @@ def prep_benchmark(dets_out, h, w):
     with timer.env('Sync'):
         # Just in case
         torch.cuda.synchronize()
+
+import json
+class NpEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NpEncoder, self).default(obj)
+
+def save_json(dict_final, name):        
+    f = open(name,"w+")
+    f.write(json.dumps(dict_final, cls=NpEncoder))
+    f.close()
     
-def evalimage_cv2(net:Yolact, image:np.array, save_path:str=None):
+def evalimage_cv2(net:Yolact, image:np.array):
     net.detect.use_fast_nms = args.fast_nms
     net.detect.use_cross_class_nms = args.cross_class_nms
     cfg.mask_proto_debug = args.mask_proto_debug
@@ -312,19 +238,9 @@ def evalimage_cv2(net:Yolact, image:np.array, save_path:str=None):
         t1 = time.time()
         print("Time for image: ", t1 - start)
 
-    img_numpy = prep_display(preds, frame, None, None, undo_transform=False)
-    
-    if save_path is None:
-        img_numpy = img_numpy[:, :, (2, 1, 0)]
+    all_boxes, all_segmentation, scores, classes = prep_display(preds, frame, None, None, undo_transform=False)
 
-    if save_path is None:
-        plt.imshow(img_numpy)
-        plt.title(save_path)
-        plt.show()
-    else:
-        cv2.imwrite(save_path, img_numpy)
-
-    
+    return all_boxes, all_segmentation, scores, classes
 
 
 class EvaluationYOLACT():
@@ -337,6 +253,7 @@ class EvaluationYOLACT():
         args.score_threshold = 0.4
 
         print(args)
+        args.config = 'yolact_base_config'
 
         if args.config is not None:
             set_cfg(args.config)
@@ -356,18 +273,11 @@ class EvaluationYOLACT():
             self.net.load_weights(model_weight_path)
             self.net.eval()
         
-    def eval(self, image, filename):
-        evalimage_cv2(self.net, image, './results_/' + filename)
+    def eval(self, image):
 
+        all_boxes, all_segmentation, scores, classes = evalimage_cv2(self.net, image)
+        
         if args.cuda:
             self.net = self.net.cuda()
-        
 
-if __name__ == '__main__':
-    # url from models weights
-    yolact=EvaluationYOLACT('weights/yolact_base_312_10000.pth')
-
-    filename = 'DJI_20220610135317_0145_W.JPG'
-    image = cv2.imread(filename)
-    yolact.eval(image, filename)   
-    exit()
+        return all_boxes, all_segmentation, scores, classes            

@@ -18,14 +18,7 @@ class Bottleneck(nn.Module):
         super(Bottleneck, self).__init__()
         self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False, dilation=dilation)
         self.bn1 = norm_layer(planes)
-        if use_dcn:
-            self.conv2 = DCN(planes, planes, kernel_size=3, stride=stride,
-                                padding=dilation, dilation=dilation, deformable_groups=1)
-            self.conv2.bias.data.zero_()
-            self.conv2.conv_offset_mask.weight.data.zero_()
-            self.conv2.conv_offset_mask.bias.data.zero_()
-        else:
-            self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
                                 padding=dilation, bias=False, dilation=dilation)
         self.bn2 = norm_layer(planes)
         self.conv3 = nn.Conv2d(planes, planes * 4, kernel_size=1, bias=False, dilation=dilation)
